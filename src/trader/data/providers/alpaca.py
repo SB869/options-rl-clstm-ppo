@@ -7,7 +7,7 @@ import json
 import time
 import pathlib
 from dataclasses import dataclass
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Iterable, Tuple
 
 import pandas as pd
 import requests
@@ -24,7 +24,7 @@ class BackfillConfig:
     end: str
     cache_dir: str = "data/options/alpaca"
     timeframe: str = "1Day"     # 1Min / 1Hour / 1Day (v1beta1 options bars)
-    feed: str = "indicative"    # "indicative" (free) or "opra" (paid)
+    feed: str = "indicative"    # kept for future use; NOT sent to /v1beta1/options/bars
     page_limit_bars: int = 50000
     page_limit_chain: int = 1000
     # endpoints / credentials (can be filled from YAML or env)
@@ -45,10 +45,18 @@ class AlpacaHTTP:
         self.log = get_logger("alpaca.http")
 
     def _maybe_gzip_to_json(self, r: requests.Response) -> Any:
-        if r.headers.get("Content-Encoding", "").lower() == "gzip":
-            with gzip.GzipFile(fileobj=io.BytesIO(r.content)) as gz:
-                return json.loads(gz.read().decode("utf-8"))
-        return r.json()
+        """
+        Safely parse JSON whether or not the server uses gzip encoding.
+        requests/urllib3 already auto-decompresses gzip/deflate.
+        """
+        try:
+            return r.json()
+        except ValueError:
+            raw = r.content
+            if raw.startswith(b"\x1f\x8b"):  # gzip magic
+                with gzip.GzipFile(fileobj=io.BytesIO(raw)) as gz:
+                    return json.loads(gz.read().decode("utf-8"))
+            return json.loads(raw.decode("utf-8"))
 
     def _check(self, r: requests.Response) -> Any:
         if 200 <= r.status_code < 300:
@@ -174,15 +182,37 @@ class AlpacaBackfill:
             time.sleep(0.05)
         return pd.DataFrame(out)
 
+    def _iter_snapshots(self, snaps: Any) -> Iterable[Tuple[Optional[str], Dict[str, Any]]]:
+        """
+        Normalize 'snapshots' to (symbol_key, snapshot_dict) pairs.
+        - If snaps is a dict: { "SYM": {...}, ... }
+        - If snaps is a list: [ {...}, ... ]
+        """
+        if isinstance(snaps, dict):
+            for sym_key, s in snaps.items():
+                if isinstance(s, dict):
+                    yield sym_key, s
+                else:
+                    # Unexpected, but preserve symbol if possible
+                    yield sym_key, {}
+        elif isinstance(snaps, list):
+            for s in snaps:
+                if isinstance(s, dict):
+                    yield None, s
+                elif isinstance(s, str):
+                    # Some APIs may return a plain symbol string
+                    yield s, {}
+        else:
+            return  # empty/unknown
+
     def _fetch_chain_snapshots(self, underlying: str) -> pd.DataFrame:
         """
         DATA API (not trading): /v1beta1/options/snapshots/{UNDERLYING}
         Returns snapshots per contract; we extract contract symbol/metadata.
+        Handles both list and dict response shapes.
         """
         params = {
             "limit": self.cfg.page_limit_chain,
-            # Optional: add filters if desired, e.g. expiration_date_gte/lte, type, etc.
-            # "expired": "false",
         }
         out: list[dict] = []
         page_token: Optional[str] = None
@@ -192,19 +222,36 @@ class AlpacaBackfill:
                 params["page_token"] = page_token
             data = self.http.get_data(path, params)
 
-            # Alpaca response shape contains items in "snapshots" (array)
-            snaps = (data or {}).get("snapshots", [])
-            for s in snaps:
-                # Different SDK versions label fields slightly differently; be defensive.
-                meta = s.get("contract") or s.get("option") or {}
-                sym = meta.get("symbol") or s.get("symbol")
+            snaps_raw = (data or {}).get("snapshots", [])
+            for sym_key, s in self._iter_snapshots(snaps_raw):
+                # prefer contract/option blocks; fall back to top-level and/or key
+                meta = {}
+                if isinstance(s, dict):
+                    meta = s.get("contract") or s.get("option") or {}
+                sym = None
+                if isinstance(meta, dict):
+                    sym = meta.get("symbol")
+                if not sym and isinstance(s, dict):
+                    sym = s.get("symbol")
+                if not sym:
+                    sym = sym_key  # final fallback from dict key or string entry
                 if not sym:
                     continue
+
+                # Extract metadata defensively
+                right = ""
+                strike = 0.0
+                expiration = None
+                if isinstance(meta, dict):
+                    right = (meta.get("type") or meta.get("right") or "")
+                    strike = meta.get("strike_price") or meta.get("strike") or 0.0
+                    expiration = meta.get("expiration_date") or meta.get("expiration")
+
                 out.append({
                     "symbol": sym,
-                    "right": (meta.get("type") or meta.get("right") or "").upper()[:1],
-                    "strike": float(meta.get("strike_price") or meta.get("strike") or 0.0),
-                    "expiration": meta.get("expiration_date") or meta.get("expiration"),
+                    "right": str(right).upper()[:1] if right else "",
+                    "strike": float(strike) if strike is not None else 0.0,
+                    "expiration": expiration,
                 })
 
             page_token = (data or {}).get("next_page_token")
@@ -220,6 +267,8 @@ class AlpacaBackfill:
     def _fetch_option_bars(self, symbols: List[str]) -> pd.DataFrame:
         """
         DATA API v1beta1: /v1beta1/options/bars
+        Note: do NOT send 'feed' – endpoint may reject it; Alpaca selects feed based on entitlements.
+        Limit is capped at 10,000 per request; use next_page_token for the rest.
         """
         if not symbols:
             return pd.DataFrame()
@@ -229,8 +278,7 @@ class AlpacaBackfill:
             "timeframe": self.cfg.timeframe,
             "start": self.cfg.start,
             "end": self.cfg.end,
-            "feed": self.cfg.feed,
-            "limit": self.cfg.page_limit_bars,
+            "limit": min(self.cfg.page_limit_bars, 10000),  # API max
         }
         out: list[dict] = []
         next_token: Optional[str] = None
