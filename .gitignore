@@ -76,3 +76,16 @@ docs/_build/
 experiments/
 output/
 outputs/
+.env
+.venv/
+build/
+lib/
+logs/
+checkpoints/
+__pycache__/
+*.pyc
+*.parquet
+*.csv
+*.png
+.pytest_cache/
+
