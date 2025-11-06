@@ -1,398 +1,268 @@
 # src/trader/data/providers/alpaca.py
 from __future__ import annotations
 import os
-import time
-import json
-import gzip
 import io
+import gzip
+import json
+import time
+import pathlib
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Dict, Iterable, List
+from typing import Dict, Any, List, Optional
 
 import pandas as pd
-import numpy as np
 import requests
-from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type
-from dateutil import parser as duparser
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from trader.utils.logging import get_logger
-from trader.utils.env import load_env, require_env
+from trader.utils.env import load_env, expand_env_in_obj
 
-UTC = timezone.utc
 
 @dataclass
-class AlpacaConfig:
-    symbols: List[str]
+class BackfillConfig:
+    underlying: str
     start: str
     end: str
-    timeframe: str
-    dte_min: int
-    dte_max: int
-    strikes_around: int
-    cache_dir: str
-    backfill: bool
-    fetch_iv: bool
-    batch_size: int
-    rate_limit_sleep: float
+    cache_dir: str = "data/options/alpaca"
+    timeframe: str = "1Day"     # 1Min / 1Hour / 1Day (v1beta1 options bars)
+    feed: str = "indicative"    # "indicative" (free) or "opra" (paid)
+    page_limit_bars: int = 50000
+    page_limit_chain: int = 1000
+    # endpoints / credentials (can be filled from YAML or env)
+    data_base: str = "https://data.alpaca.markets"
+    key_id: Optional[str] = None
+    secret_key: Optional[str] = None
 
-def _get_base_url() -> str:
-    # Default to official data endpoint if not set
-    return os.getenv("APCA_API_BASE_URL", "https://data.alpaca.markets")
-
-def _get_headers() -> dict:
-    envs = require_env(["APCA_API_KEY_ID", "APCA_API_SECRET_KEY"])
-    return {
-        "APCA-API-KEY-ID": envs["APCA_API_KEY_ID"],
-        "APCA-API-SECRET-KEY": envs["APCA_API_SECRET_KEY"],
-        "Accept": "application/json",
-        "Accept-Encoding": "gzip, deflate",
-        "User-Agent": "options-rl-clstm-ppo/0.1",
-    }
-
-def _parse_ts(s: str) -> datetime:
-    return duparser.isoparse(s).astimezone(UTC)
-
-def _safe_json(resp: requests.Response) -> dict:
-    """
-    Robust JSON loader:
-    - Prefer resp.json() (requests handles gzip/deflate itself).
-    - If that fails *and* header claims gzip, try manual gunzip.
-    - If still failing, raise with body snippet.
-    """
-    enc = (resp.headers.get("Content-Encoding") or "").lower()
-    try:
-        return resp.json()
-    except Exception:
-        if "gzip" in enc:
-            try:
-                buf = io.BytesIO(resp.content or b"")
-                with gzip.GzipFile(fileobj=buf) as gz:
-                    data = gz.read()
-                return json.loads(data.decode("utf-8"))
-            except Exception:
-                pass
-        # last-ditch
-        try:
-            return json.loads(resp.text)
-        except Exception:
-            snippet = (resp.content or b"")[:200]
-            raise requests.RequestException(
-                f"Failed to parse JSON (status={resp.status_code}, enc='{enc}'). "
-                f"Body head: {snippet!r}"
-            )
 
 class AlpacaHTTP:
-    def __init__(self, rate_limit_sleep: float = 0.5):
-        self.base_url = _get_base_url()
+    def __init__(self, data_base: str, key_id: str, secret_key: str):
+        self.data_base = data_base.rstrip("/")
         self.s = requests.Session()
-        self.s.headers.update(_get_headers())
-        self.sleep = rate_limit_sleep
+        self.s.headers.update({
+            "APCA-API-KEY-ID": key_id,
+            "APCA-API-SECRET-KEY": secret_key,
+            "Accept": "application/json",
+        })
         self.log = get_logger("alpaca.http")
 
+    def _maybe_gzip_to_json(self, r: requests.Response) -> Any:
+        if r.headers.get("Content-Encoding", "").lower() == "gzip":
+            with gzip.GzipFile(fileobj=io.BytesIO(r.content)) as gz:
+                return json.loads(gz.read().decode("utf-8"))
+        return r.json()
+
+    def _check(self, r: requests.Response) -> Any:
+        if 200 <= r.status_code < 300:
+            return self._maybe_gzip_to_json(r)
+        try:
+            body = r.json()
+        except Exception:
+            body = r.text[:500]
+        raise requests.RequestException(f"HTTP {r.status_code}: {body}")
+
     @retry(
-        wait=wait_exponential(multiplier=1, min=1, max=30),
+        reraise=True,
         stop=stop_after_attempt(6),
-        retry=retry_if_exception_type((requests.RequestException,))
+        wait=wait_exponential(multiplier=1, min=1, max=30),
+        retry=retry_if_exception_type(requests.RequestException),
     )
-    def get(self, path: str, params: dict) -> dict:
-        url = f"{self.base_url}{path}"
-        r = self.s.get(url, params=params, timeout=30)
+    def get_data(self, path: str, params: Dict[str, Any]) -> Any:
+        url = f"{self.data_base}/{path.lstrip('/')}"
+        r = self.s.get(url, params=params, timeout=60)
+        # handle basic rate limiting gently
         if r.status_code == 429:
-            reset = r.headers.get("x-ratelimit-reset") or r.headers.get("Retry-After")
-            self.log.warning(f"429 Too Many Requests; reset={reset}, backing off…")
-            time.sleep(self.sleep * 2.0)
-            raise requests.RequestException("429 Too Many Requests")
-        if not r.ok:
-            # Surface Alpaca's message if any
-            try:
-                err = r.json()
-            except Exception:
-                err = r.text
-            raise requests.RequestException(f"HTTP {r.status_code}: {err}")
-        time.sleep(self.sleep)
-        return _safe_json(r)
+            self.log.warning("429 Too Many Requests; backing off…")
+            time.sleep(1.5)
+            raise requests.RequestException("rate limited")
+        return self._check(r)
 
-def _select_atm_strikes(chain_df: pd.DataFrame, spot: float, k: int) -> pd.DataFrame:
-    chain_df = chain_df.copy()
-    chain_df["atm_dist"] = (chain_df["strike"] - spot).abs()
-    chain_df.sort_values("atm_dist", inplace=True)
-    return chain_df.groupby(["expiration", "right"]).head(1 + 2 * k)
-
-def _partition_path(cache_dir: str, underlying: str, date_str: str, right: str, expiration: str) -> str:
-    p = os.path.join(cache_dir, underlying, date_str, right, expiration)
-    os.makedirs(p, exist_ok=True)
-    return p
-
-def _write_parquet(df: pd.DataFrame, path: str):
-    if df.empty:
-        return
-    df.to_parquet(path, index=False)
-
-def _read_parquet_dir(dir_path: str) -> pd.DataFrame:
-    files = [os.path.join(dir_path, f) for f in os.listdir(dir_path) if f.endswith(".parquet")]
-    if not files:
-        return pd.DataFrame()
-    return pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
 
 class AlpacaBackfill:
-    def __init__(self, cfg: AlpacaConfig):
-        # ensure .env is loaded and keys are present
-        load_env()
-        _ = _get_headers()
+    """
+    Backfills:
+      1) underlying daily bars from /v2/stocks/bars  (data.alpaca.markets)
+      2) option 'chain' via /v1beta1/options/snapshots/{UNDERLYING}
+      3) option bars via /v1beta1/options/bars
+    Saves Parquet into cache_dir.
+    """
+    def __init__(self, cfg: BackfillConfig | Dict[str, Any]):
+        load_env()  # ensure .env loaded
+
+        if isinstance(cfg, dict):
+            cfg = BackfillConfig(**expand_env_in_obj(cfg))
+        else:
+            # in case any fields in dataclass carry ${VAR}
+            cfg = BackfillConfig(**expand_env_in_obj(cfg.__dict__))
+
+        # allow env fallback for creds
+        key = cfg.key_id or os.getenv("APCA_API_KEY_ID") or os.getenv("ALPACA_KEY_ID")
+        sec = cfg.secret_key or os.getenv("APCA_API_SECRET_KEY") or os.getenv("ALPACA_SECRET_KEY")
+        if not key or not sec:
+            raise RuntimeError("Missing APCA_API_KEY_ID / APCA_API_SECRET_KEY in env or config.")
+
         self.cfg = cfg
-        self.h = AlpacaHTTP(rate_limit_sleep=cfg.rate_limit_sleep)
+        self.http = AlpacaHTTP(cfg.data_base, key, sec)
         self.log = get_logger("alpaca.backfill")
 
-    def run(self):
-        for underlying in self.cfg.symbols:
-            self.log.info(f"[Backfill] underlying={underlying} {self.cfg.start} → {self.cfg.end}")
-            u_bars = self._fetch_underlying_bars(underlying)
-            if u_bars.empty:
-                raise RuntimeError("No underlying bars returned")
-            first_day = u_bars["ts"].dt.date.min()
-            spot0 = float(u_bars.loc[u_bars["ts"].dt.date == first_day, "close"].median())
-            self.log.info(f"[Backfill] first-day median close (spot0) ~ {spot0:.2f}")
+        self.base_dir = pathlib.Path(cfg.cache_dir) / cfg.underlying.upper()
+        self.base_dir.mkdir(parents=True, exist_ok=True)
 
-            chain = self._fetch_chain(underlying)
-            if chain.empty:
-                raise RuntimeError("Empty options chain")
-            chain = self._filter_chain_by_dte(chain)
-            chain = _select_atm_strikes(chain, spot0, self.cfg.strikes_around)
-            self.log.info(f"[Backfill] selected contracts: {len(chain)}")
+    def run(self) -> None:
+        u = self.cfg.underlying.upper()
+        self.log.info(f"[Backfill] underlying={u} {self.cfg.start} → {self.cfg.end}")
 
-            self._write_underlying_parquet(underlying, u_bars)
-            self._fetch_and_write_option_bars(underlying, chain)
+        # 1) underlying bars (daily)
+        u_df = self._fetch_underlying_bars(u)
+        if not u_df.empty:
+            first_close = u_df.iloc[:10]["close"].median()
+            self.log.info(f"[Backfill] first-day median close (spot0) ~ {first_close:.2f}")
+        self._save_parquet(u_df, self.base_dir / f"{u}_underlying_{self.cfg.start}_{self.cfg.end}.parquet")
 
+        # 2) chain via snapshots (data domain)
+        chain = self._fetch_chain_snapshots(u)
+        if chain.empty:
+            self.log.warning("Snapshots returned empty chain; stopping.")
+            return
+        self._save_parquet(chain, self.base_dir / f"{u}_chain_{self.cfg.start}_{self.cfg.end}.parquet")
+
+        # 3) bars for symbols (chunked)
+        syms = chain["symbol"].unique().tolist()
+        if not syms:
+            self.log.warning("No symbols from chain; stopping.")
+            return
+
+        CHUNK = 150
+        for i in range(0, len(syms), CHUNK):
+            batch = syms[i:i+CHUNK]
+            bars = self._fetch_option_bars(batch)
+            out = self.base_dir / f"{u}_bars_{i:05d}_{i+len(batch)-1:05d}.parquet"
+            self._save_parquet(bars, out)
+
+        self.log.info("[Backfill] ✅ done.")
+
+    # ---------- helpers ----------
     def _fetch_underlying_bars(self, symbol: str) -> pd.DataFrame:
         params = {
-            "timeframe": self.cfg.timeframe,
+            "symbols": symbol,
+            "timeframe": "1Day",
             "start": self.cfg.start,
             "end": self.cfg.end,
-            "limit": 10000,
+            "limit": 5000,
             "adjustment": "raw",
-            "feed": "sip",
-            "page_token": None,
         }
-        path = f"/v2/stocks/{symbol}/bars"
-        rows = []
+        out: list[dict] = []
+        next_token: Optional[str] = None
         while True:
-            data = self.h.get(path, params)
-            bars = data.get("bars", [])
+            if next_token:
+                params["page_token"] = next_token
+            data = self.http.get_data("/v2/stocks/bars", params)
+            bars = (data or {}).get("bars", {}).get(symbol, [])
             for b in bars:
-                rows.append({
-                    "ts": _parse_ts(b["t"]),
-                    "open": b["o"], "high": b["h"], "low": b["l"], "close": b["c"],
-                    "volume": b.get("v", 0),
+                out.append({
+                    "symbol": symbol,
+                    "t": b.get("t"),
+                    "open": b.get("o"),
+                    "high": b.get("h"),
+                    "low":  b.get("l"),
+                    "close": b.get("c"),
+                    "volume": b.get("v"),
+                    "n": b.get("n"),
+                    "vw": b.get("vw"),
                 })
-            nxt = data.get("next_page_token")
-            if nxt:
-                params["page_token"] = nxt
-            else:
+            next_token = (data or {}).get("next_page_token")
+            if not next_token:
                 break
-        df = pd.DataFrame(rows)
-        if not df.empty:
-            df.sort_values("ts", inplace=True)
-        return df
+            time.sleep(0.05)
+        return pd.DataFrame(out)
 
-    def _fetch_chain(self, underlying: str) -> pd.DataFrame:
-        params = {"underlying": underlying, "status": "active", "limit": 1000, "page_token": None}
-        path = "/v2/options/contracts"
-        rows = []
-        while True:
-            data = self.h.get(path, params)
-            cs = data.get("contracts", [])
-            for c in cs:
-                rows.append({
-                    "symbol": c["symbol"],
-                    "underlying": c["underlying_symbol"],
-                    "right": c["type"].upper()[0],
-                    "strike": float(c["strike"]),
-                    "expiration": c["expiration_date"],
-                })
-            nxt = data.get("next_page_token")
-            if nxt:
-                params["page_token"] = nxt
-            else:
-                break
-        df = pd.DataFrame(rows)
-        if df.empty:
-            return df
-        df.drop_duplicates(subset=["symbol"], inplace=True)
-        return df
-
-    def _filter_chain_by_dte(self, chain: pd.DataFrame) -> pd.DataFrame:
-        start_dt = duparser.isoparse(self.cfg.start).date()
-        end_dt = duparser.isoparse(self.cfg.end).date()
-        chain = chain.copy()
-        chain["expiration"] = pd.to_datetime(chain["expiration"]).dt.date
-        dte = (chain["expiration"] - start_dt).apply(lambda x: x.days)
-        mask = (dte >= self.cfg.dte_min) & (dte <= self.cfg.dte_max) & (chain["expiration"] <= end_dt)
-        return chain.loc[mask].reset_index(drop=True)
-
-    def _write_underlying_parquet(self, underlying: str, u_bars: pd.DataFrame):
-        u_bars = u_bars.copy()
-        u_bars["date"] = u_bars["ts"].dt.date.astype(str)
-        for d, sdf in u_bars.groupby("date"):
-            outdir = os.path.join(self.cfg.cache_dir, underlying, d, "_underlying")
-            os.makedirs(outdir, exist_ok=True)
-            _write_parquet(sdf.drop(columns=["date"]), os.path.join(outdir, "bars.parquet"))
-
-    def _fetch_and_write_option_bars(self, underlying: str, chain_df: pd.DataFrame):
-        sym_list = chain_df["symbol"].tolist()
-        B = self.cfg.batch_size
-        for i in range(0, len(sym_list), B):
-            batch = sym_list[i:i+B]
-            self._fetch_write_bars_batch(underlying, chain_df, batch)
-
-    def _fetch_write_bars_batch(self, underlying: str, chain_df: pd.DataFrame, batch_syms: List[str]):
+    def _fetch_chain_snapshots(self, underlying: str) -> pd.DataFrame:
+        """
+        DATA API (not trading): /v1beta1/options/snapshots/{UNDERLYING}
+        Returns snapshots per contract; we extract contract symbol/metadata.
+        """
         params = {
-            "symbols": ",".join(batch_syms),
+            "limit": self.cfg.page_limit_chain,
+            # Optional: add filters if desired, e.g. expiration_date_gte/lte, type, etc.
+            # "expired": "false",
+        }
+        out: list[dict] = []
+        page_token: Optional[str] = None
+        path = f"/v1beta1/options/snapshots/{underlying}"
+        while True:
+            if page_token:
+                params["page_token"] = page_token
+            data = self.http.get_data(path, params)
+
+            # Alpaca response shape contains items in "snapshots" (array)
+            snaps = (data or {}).get("snapshots", [])
+            for s in snaps:
+                # Different SDK versions label fields slightly differently; be defensive.
+                meta = s.get("contract") or s.get("option") or {}
+                sym = meta.get("symbol") or s.get("symbol")
+                if not sym:
+                    continue
+                out.append({
+                    "symbol": sym,
+                    "right": (meta.get("type") or meta.get("right") or "").upper()[:1],
+                    "strike": float(meta.get("strike_price") or meta.get("strike") or 0.0),
+                    "expiration": meta.get("expiration_date") or meta.get("expiration"),
+                })
+
+            page_token = (data or {}).get("next_page_token")
+            if not page_token:
+                break
+            time.sleep(0.1)
+
+        df = pd.DataFrame(out)
+        if not df.empty:
+            df.drop_duplicates(subset=["symbol"], inplace=True)
+        return df
+
+    def _fetch_option_bars(self, symbols: List[str]) -> pd.DataFrame:
+        """
+        DATA API v1beta1: /v1beta1/options/bars
+        """
+        if not symbols:
+            return pd.DataFrame()
+
+        params = {
+            "symbols": ",".join(symbols),
+            "timeframe": self.cfg.timeframe,
             "start": self.cfg.start,
             "end": self.cfg.end,
-            "timeframe": self.cfg.timeframe,
-            "limit": 10000,
-            "adjustment": "raw",
-            "feed": "opra",
-            "page_token": None,
+            "feed": self.cfg.feed,
+            "limit": self.cfg.page_limit_bars,
         }
-        path = "/v2/options/bars"
-        all_rows: List[dict] = []
+        out: list[dict] = []
+        next_token: Optional[str] = None
         while True:
-            data = self.h.get(path, params)
-            bars = data.get("bars", {})
-            for sym, recs in bars.items():
-                row = chain_df.loc[chain_df["symbol"] == sym]
-                if row.empty:
-                    continue
-                right = row["right"].values[0]
-                strike = float(row["strike"].values[0])
-                expiration = str(row["expiration"].values[0])
-                for b in recs:
-                    all_rows.append({
-                        "ts": _parse_ts(b["t"]),
+            if next_token:
+                params["page_token"] = next_token
+            data = self.http.get_data("/v1beta1/options/bars", params)
+            bars_by_sym = (data or {}).get("bars", {})
+            for sym, rows in bars_by_sym.items():
+                for b in rows:
+                    out.append({
                         "symbol": sym,
-                        "underlying": underlying,
-                        "right": right,
-                        "strike": strike,
-                        "expiration": expiration,
-                        "open": b.get("o", np.nan),
-                        "high": b.get("h", np.nan),
-                        "low": b.get("l", np.nan),
-                        "close": b.get("c", np.nan),
-                        "volume": b.get("v", 0),
-                        "trade_count": b.get("n", 0),
-                        "vw": b.get("vw", np.nan),
+                        "t": b.get("t"),
+                        "open": b.get("o"),
+                        "high": b.get("h"),
+                        "low":  b.get("l"),
+                        "close": b.get("c"),
+                        "volume": b.get("v"),
+                        "n": b.get("n"),
+                        "vw": b.get("vw"),
                     })
-            nxt = data.get("next_page_token")
-            if nxt:
-                params["page_token"] = nxt
-            else:
+            next_token = (data or {}).get("next_page_token")
+            if not next_token:
                 break
+            time.sleep(0.1)
 
-        if not all_rows:
+        return pd.DataFrame(out)
+
+    def _save_parquet(self, df: pd.DataFrame, path: pathlib.Path) -> None:
+        if df is None or df.empty:
+            self.log.warning(f"[Backfill] empty frame, skip save: {path.name}")
             return
-        df = pd.DataFrame(all_rows)
-        df.sort_values(["symbol", "ts"], inplace=True)
-        df["date"] = df["ts"].dt.date.astype(str)
-
-        for (d, r, exp), sdf in df.groupby(["date", "right", "expiration"]):
-            outdir = _partition_path(self.cfg.cache_dir, underlying, d, r, exp)
-            fname = f"part_{hash(tuple(sdf['symbol'].unique())) & 0xfffffff:x}.parquet"
-            _write_parquet(sdf.drop(columns=["date"]), os.path.join(outdir, fname))
-
-class AlpacaProvider:
-    def __init__(self, cfg_dict: Dict):
-        self.log = get_logger("alpaca.provider")
-        self.cfg = AlpacaConfig(
-            symbols=cfg_dict["symbols"],
-            start=cfg_dict["start"],
-            end=cfg_dict["end"],
-            timeframe=cfg_dict.get("timeframe", "1Min"),
-            dte_min=int(cfg_dict.get("dte_min", 7)),
-            dte_max=int(cfg_dict.get("dte_max", 30)),
-            strikes_around=int(cfg_dict.get("strikes_around", 5)),
-            cache_dir=cfg_dict.get("cache_dir", "data/alpaca"),
-            backfill=bool(cfg_dict.get("backfill", False)),
-            fetch_iv=bool(cfg_dict.get("fetch_iv", False)),
-            batch_size=int(cfg_dict.get("batch_size", 100)),
-            rate_limit_sleep=float(cfg_dict.get("rate_limit_sleep", 0.5)),
-        )
-
-        if self.cfg.backfill:
-            self.log.info("Backfill requested; fetching from Alpaca into Parquet cache ...")
-            AlpacaBackfill(self.cfg).run()
-            self.log.info("Backfill complete. Switching to cache-only mode.")
-
-        self._index_cache()
-        self._feature_dim = 8  # simple starter spec; extend as you add features
-
-    def observation_spec(self) -> Dict[str, int]:
-        return {"feature_dim": self._feature_dim}
-
-    def reset(self) -> None:
-        pass
-
-    def _index_cache(self):
-        self.by_und_dates: Dict[str, List[str]] = {}
-        for und in self.cfg.symbols:
-            und_root = os.path.join(self.cfg.cache_dir, und)
-            if not os.path.isdir(und_root):
-                self.by_und_dates[und] = []
-                continue
-            dates = sorted([d for d in os.listdir(und_root) if d[:4].isdigit()])
-            self.by_und_dates[und] = dates
-        self.log.info(f"Indexed cache: { {k: len(v) for k,v in self.by_und_dates.items()} }")
-
-    def stream(self) -> Iterable[tuple[dict, list[dict]]]:
-        for und in self.cfg.symbols:
-            for d in self.by_und_dates.get(und, []):
-                u_path = os.path.join(self.cfg.cache_dir, und, d, "_underlying", "bars.parquet")
-                if not os.path.exists(u_path):
-                    continue
-                u_df = pd.read_parquet(u_path)
-
-                parts = []
-                day_dir = os.path.join(self.cfg.cache_dir, und, d)
-                for right in ("C", "P"):
-                    right_dir = os.path.join(day_dir, right)
-                    if not os.path.isdir(right_dir):
-                        continue
-                    for exp in os.listdir(right_dir):
-                        pdir = os.path.join(right_dir, exp)
-                        if os.path.isdir(pdir):
-                            parts.append(_read_parquet_dir(pdir))
-                if not parts:
-                    continue
-                o_df = pd.concat(parts, ignore_index=True)
-                o_df.sort_values(["symbol", "ts"], inplace=True)
-                o_df["close_ffill"] = o_df.groupby("symbol")["close"].ffill()
-
-                for _, row in u_df.iterrows():
-                    ts = row["ts"]
-                    sdf = o_df[o_df["ts"] == ts]
-                    if sdf.empty:
-                        sdf = o_df[o_df["ts"] < ts].groupby("symbol").tail(1)
-                        if sdf.empty:
-                            continue
-                    und_bar = {
-                        "ts": ts,
-                        "open": float(row["open"]), "high": float(row["high"]),
-                        "low": float(row["low"]), "close": float(row["close"]),
-                        "volume": float(row.get("volume", 0)),
-                    }
-                    slice_list: list[dict] = []
-                    for _, r in sdf.iterrows():
-                        dte = (pd.to_datetime(r["expiration"]).tz_localize(UTC) - ts).days
-                        mny = float(row["close"]) / float(r["strike"])
-                        slice_list.append({
-                            "ts": ts,
-                            "symbol": r["symbol"],
-                            "right": r["right"],
-                            "strike": float(r["strike"]),
-                            "expiration": str(r["expiration"]),
-                            "dte": int(max(dte, 0)),
-                            "close": float(r.get("close_ffill", r.get("close", np.nan))),
-                            "volume": float(r.get("volume", 0)),
-                            "moneyness": mny,
-                        })
-                    yield und_bar, slice_list
+        path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_parquet(path, index=False)
+        self.log.info(f"[Backfill] wrote {path} rows={len(df):,}")

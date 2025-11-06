@@ -2,40 +2,37 @@
 from __future__ import annotations
 import argparse
 import yaml
-import traceback
 
 from trader.utils.logging import get_logger
-from trader.utils.env import load_env
-from trader.data.providers.alpaca import AlpacaBackfill, AlpacaConfig
+from trader.utils.env import load_env, expand_env_in_obj
+from trader.data.providers.alpaca import AlpacaBackfill, BackfillConfig
 
 def main(config_path: str):
     log = get_logger("backfill")
-    load_env()  # load .env before touching Alpaca
-    with open(config_path, "r") as f:
-        cfg = yaml.safe_load(f)
+    load_env()
 
-    d = cfg["data"]
-    ac = AlpacaConfig(
-        symbols=d["symbols"],
-        start=d["start"],
-        end=d["end"],
-        timeframe=d.get("timeframe", "1Min"),
-        dte_min=int(d.get("dte_min", 7)),
-        dte_max=int(d.get("dte_max", 30)),
-        strikes_around=int(d.get("strikes_around", 5)),
-        cache_dir=d.get("cache_dir", "data/alpaca"),
-        backfill=True,
-        fetch_iv=bool(d.get("fetch_iv", False)),
-        batch_size=int(d.get("batch_size", 100)),
-        rate_limit_sleep=float(d.get("rate_limit_sleep", 0.5)),
+    with open(config_path, "r") as f:
+        raw = yaml.safe_load(f) or {}
+    cfg = expand_env_in_obj(raw)
+
+    data = cfg.get("data", {})
+    alp = cfg.get("alpaca", {})  # optional block for endpoints/creds
+
+    backfill_cfg = BackfillConfig(
+        underlying=data["symbols"][0] if isinstance(data.get("symbols"), list) else data.get("underlying", "SPY"),
+        start=data["start"],
+        end=data["end"],
+        cache_dir=data.get("cache_dir", "data/options/alpaca"),
+        timeframe=data.get("timeframe", "1Day"),
+        feed=data.get("feed", "indicative"),
+        page_limit_bars=int(data.get("page_limit_bars", 50000)),
+        page_limit_chain=int(data.get("page_limit_chain", 1000)),
+        data_base=alp.get("data_base", "https://data.alpaca.markets"),
+        key_id=alp.get("key_id"),        # if None, falls back to env APCA_API_KEY_ID
+        secret_key=alp.get("secret_key") # if None, falls back to env APCA_API_SECRET_KEY
     )
 
-    try:
-        AlpacaBackfill(ac).run()
-    except Exception as e:
-        log.error(f"Backfill failed: {e}")
-        traceback.print_exc()
-        raise
+    AlpacaBackfill(backfill_cfg).run()
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
