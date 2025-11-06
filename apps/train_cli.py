@@ -5,15 +5,18 @@ import json
 import yaml
 import torch
 
+from trader.utils.env import load_env   # <-- NEW
+load_env()                               # <-- NEW
+
 from trader.utils.logging import get_logger
 from trader.utils.seed import set_global_seed
 from trader.data.providers.sim import SimProvider
+from trader.data.providers.alpaca import AlpacaProvider
 from trader.env.options_env import OptionsTradingEnv
 from trader.models.feature_lstm import FeatureLSTM
 from trader.models.policy_lstm import RecurrentActorCritic
 from trader.training.ppo import PPOTrainer
 from trader.training.callbacks import Callbacks, CheckpointCfg
-
 
 def main(config_path: str, mode: str, auto_eval_episodes: int = 3, enable_tb: bool = True):
     with open(config_path, "r") as f:
@@ -29,14 +32,19 @@ def main(config_path: str, mode: str, auto_eval_episodes: int = 3, enable_tb: bo
     device = torch.device("cuda" if use_cuda else "cpu")
     log.info(f"Using device: {device}")
 
-    # --- Provider & Env ---
-    provider = SimProvider(
-        symbols=cfg["data"]["symbols"],
-        days=cfg["data"]["days"],
-        option_kind=cfg["env"]["option"]["kind"],
-        dte_start=cfg["env"]["option"]["dte_start"],
-        seed=cfg.get("seed", 42),
-    )
+    # --- Provider selection ---
+    prov_name = (cfg.get("data") or {}).get("provider", "sim").lower()
+    if prov_name == "alpaca":
+        provider = AlpacaProvider(cfg["data"])
+    else:
+        provider = SimProvider(
+            symbols=cfg["data"]["symbols"],
+            days=cfg["data"]["days"],
+            option_kind=cfg["env"]["option"]["kind"],
+            dte_start=cfg["env"]["option"]["dte_start"],
+            seed=cfg.get("seed", 42),
+        )
+
     obs_spec = provider.observation_spec()
 
     env = OptionsTradingEnv(
@@ -46,7 +54,7 @@ def main(config_path: str, mode: str, auto_eval_episodes: int = 3, enable_tb: bo
         max_positions=cfg["env"]["max_positions"],
     )
 
-    # --- Model sizing: larger on GPU, smaller on CPU ---
+    # --- Model sizing ---
     hid = 128 if device.type == "cuda" else 16
     feature = FeatureLSTM(input_dim=obs_spec["feature_dim"], hidden_dim=hid).to(device)
     policy = RecurrentActorCritic(
@@ -55,7 +63,7 @@ def main(config_path: str, mode: str, auto_eval_episodes: int = 3, enable_tb: bo
         hidden=hid
     ).to(device)
 
-    # --- Callbacks: TB + auto-eval + run registry ---
+    # --- Callbacks (TB, auto-eval, registry) ---
     callbacks = Callbacks(
         ckpt=CheckpointCfg(base_dir="checkpoints", name="sim", keep=3, run_mode=mode),
         base_log_dir="logs",
@@ -66,7 +74,7 @@ def main(config_path: str, mode: str, auto_eval_episodes: int = 3, enable_tb: bo
     )
     callbacks.on_train_start(cfg)
 
-    # ➜ Immediately store model hyperparams into meta.json (so eval uses SAME sizes)
+    # Save model sizes for eval
     paths = callbacks.get_run_paths()
     try:
         with open(paths["meta"], "r", encoding="utf-8") as f:
@@ -81,7 +89,6 @@ def main(config_path: str, mode: str, auto_eval_episodes: int = 3, enable_tb: bo
     except Exception:
         pass
 
-    # --- Trainer (passes device/AMP options) ---
     amp_dtype = (cfg["trainer"].get("amp_dtype", "bfloat16") if "trainer" in cfg else "bfloat16")
     trainer = PPOTrainer(
         env=env,

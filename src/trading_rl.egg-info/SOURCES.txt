@@ -1,6 +1,7 @@
 README.md
 pyproject.toml
 src/trader/constants.py
+src/trader/data/providers/alpaca.py
 src/trader/data/providers/sim.py
 src/trader/env/options_env.py
 src/trader/env/risk.py
