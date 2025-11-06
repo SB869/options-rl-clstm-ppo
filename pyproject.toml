@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trading-rl"
+version = "0.1.0"
+description = "CLSTM-PPO options trading scaffold (paper-faithful + options adaptations)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "torch>=2.2",          # model + training
+  "numpy>=1.24",
+  "pandas>=2.1",
+  "gymnasium>=0.29",     # env API
+  "scipy>=1.11",         # turbulence (Mahalanobis), BS bits
+  "pyyaml>=6.0",         # configs
+  "tqdm>=4.66",
+  "matplotlib>=3.7",     # plotting for train/eval PNGs
+  "tensorboard>=2.14",   # monitoring dashboards (free)
+  # Optional: "tyro>=0.7.3" if you later use it for CLIs
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.black]
+line-length = 100
+
+[tool.ruff]
+line-length = 100
+select = ["E","F","I","UP"]

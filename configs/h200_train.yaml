@@ -1,0 +1,41 @@
+seed: 123
+
+data:
+  symbols: [SPY]
+  days: 250            # ~1 year of sim steps; increase as you like
+
+env:
+  option:
+    kind: call
+    dte_start: 30
+  costs:
+    commission_per_contract: 0.65
+    spread_bps: 15
+    scale: 1e-4
+  turbulence:
+    window: 60
+    pct: 0.9
+    enabled: true
+  max_positions: 20
+
+trainer:
+  # PPO core
+  episodes: 100
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_eps: 0.2
+  value_coef: 0.5
+  entropy_coef: 0.01
+  lr: 3.0e-4
+  batch_steps: 2048        # rollout per update
+
+  # New stability/throughput knobs
+  epochs: 10               # PPO epochs per update
+  minibatch_size: 256
+  value_clip: 0.2
+  target_kl: 0.02          # early-stop a PPO update if KL exceeds this
+  entropy_target: null     # e.g., 0.2 to anneal log_std; null = disabled
+
+  # Device / precision
+  device: "cuda"           # "cuda" on H200, falls back to cpu if unavailable
+  amp_dtype: "bfloat16"    # "bfloat16" on Hopper, or "float16", or "auto"

@@ -1,0 +1,44 @@
+{
+  "run_id": "20251106_023132",
+  "mode": "local",
+  "start_time": "2025-11-06T02:31:32.064789",
+  "cfg": {
+    "seed": 123,
+    "data": {
+      "symbols": [
+        "SPY"
+      ],
+      "days": 20
+    },
+    "env": {
+      "option": {
+        "kind": "call",
+        "dte_start": 20
+      },
+      "costs": {
+        "commission_per_contract": 0.65,
+        "spread_bps": 15,
+        "scale": "1e-4"
+      },
+      "turbulence": {
+        "window": 30,
+        "pct": 0.9,
+        "enabled": false
+      },
+      "max_positions": 4
+    },
+    "trainer": {
+      "episodes": 3,
+      "gamma": 0.99,
+      "gae_lambda": 0.95,
+      "clip_eps": 0.2,
+      "value_coef": 0.5,
+      "entropy_coef": 0.01,
+      "lr": 0.0003,
+      "batch_steps": 128
+    }
+  },
+  "config_path": "configs/local_debug.yaml",
+  "ckpt_dir": "checkpoints\\local\\sim_20251106_023132",
+  "tb_dir": "logs\\local\\20251106_023132\\tb"
+}

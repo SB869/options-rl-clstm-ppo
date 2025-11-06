@@ -1,0 +1,58 @@
+{
+  "run_id": "20251106_015921",
+  "mode": "local",
+  "start_time": "2025-11-06T01:59:21.535396",
+  "cfg": {
+    "seed": 123,
+    "data": {
+      "symbols": [
+        "SPY"
+      ],
+      "days": 20
+    },
+    "env": {
+      "option": {
+        "kind": "call",
+        "dte_start": 20
+      },
+      "costs": {
+        "commission_per_contract": 0.65,
+        "spread_bps": 15,
+        "scale": "1e-4"
+      },
+      "turbulence": {
+        "window": 30,
+        "pct": 0.9,
+        "enabled": false
+      },
+      "max_positions": 4
+    },
+    "trainer": {
+      "episodes": 3,
+      "gamma": 0.99,
+      "gae_lambda": 0.95,
+      "clip_eps": 0.2,
+      "value_coef": 0.5,
+      "entropy_coef": 0.01,
+      "lr": 0.0003,
+      "batch_steps": 128
+    }
+  },
+  "config_path": "configs/local_debug.yaml",
+  "ckpt_dir": "checkpoints\\local\\sim_20251106_015921",
+  "end_time": "2025-11-06T01:59:22.931559",
+  "episodes": 3,
+  "last_checkpoint": "checkpoints\\local\\sim_20251106_015921\\sim_ep00003.pt",
+  "eval": {
+    "sharpe": 0.19221096714791464,
+    "sortino": 0.2944681819567534,
+    "max_drawdown": 1.925944149149701e-05,
+    "hit_rate": 0.5087719298245614,
+    "avg_profit_per_trade": 4.6270582177512865e-06,
+    "max_earning_rate": 0.0015414169711293654,
+    "turnover": 7780.593849699823,
+    "total_return": 6.978926766081643e-06
+  },
+  "eval_json": "logs\\local\\20251106_015921\\eval.json",
+  "eval_plot": "logs\\local\\20251106_015921\\eval_plot.png"
+}

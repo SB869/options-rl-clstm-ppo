@@ -1,0 +1,29 @@
+seed: 123
+
+data:
+  symbols: [SPY]
+  days: 20            # shorter path
+
+env:
+  option:
+    kind: call
+    dte_start: 20     # shorter DTE
+  costs:
+    commission_per_contract: 0.65
+    spread_bps: 15
+    scale: 1e-4
+  turbulence:
+    window: 30
+    pct: 0.9
+    enabled: false    # fewer risk-off branches to evaluate
+  max_positions: 4    # smaller action effect
+
+trainer:
+  episodes: 3         # fewer episodes
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_eps: 0.2
+  value_coef: 0.5
+  entropy_coef: 0.01
+  lr: 3.0e-4
+  batch_steps: 128    # short rollouts
