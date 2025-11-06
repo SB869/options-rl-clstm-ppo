@@ -1,0 +1,78 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Virtual environment
+.venv/
+venv/
+ENV/
+env/
+.ENV/
+
+# Python env
+.Python
+
+# Installer logs
+pip-log.txt
+pip-log.txt
+
+# Unit test / coverage reports
+htmlcov/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+
+# Pytest cache
+.pytest_cache/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints
+
+# My editor/IDE files
+.vscode/
+.idea/
+*.sublime-workspace
+*.sublime-project
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Sphinx documentation build
+docs/_build/
+
+# If you use VS Code settings
+.vscode/
+
+# If you compile or generate C/C++ code
+*.o
+*.a
+*.dylib
+*.dll
+
+# Ignore cartes-type plot or large data files you produce
+*.pkl
+*.h5
+*.npz
+*.ckpt
+*.pth
+
+# Ignore general data output/experiments directory if used
+experiments/
+output/
+outputs/

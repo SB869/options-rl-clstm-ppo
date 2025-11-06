@@ -1,3 +1,4 @@
+# src/trader/training/callbacks.py
 from __future__ import annotations
 import csv
 import json
@@ -24,17 +25,6 @@ class CheckpointCfg:
 
 
 class Callbacks:
-    """
-    Handles:
-      - Run directories
-      - CSV logging
-      - TensorBoard logging (optional)
-      - Checkpoints (rotated)
-      - Post-train evaluation (eval.json + eval_plot.png in SAME run dir)
-      - Run registry (logs/index.csv)
-      - 'latest.txt' pointers for logs/ and checkpoints/
-    """
-
     def __init__(
         self,
         ckpt: Optional[CheckpointCfg] = None,
@@ -51,7 +41,6 @@ class Callbacks:
         self.config_path = config_path
         self.enable_tb = enable_tb and SummaryWriter is not None
 
-        # Will be set in on_train_start()
         self.run_id: Optional[str] = None
         self.run_dir: Optional[str] = None
         self.csv_path: Optional[str] = None
@@ -62,30 +51,25 @@ class Callbacks:
         self._start_ts: Optional[str] = None
         self._last_ckpt_path: Optional[str] = None
 
-        # TensorBoard
         self.tb_writer: Optional[SummaryWriter] = None
         self.tb_dir: Optional[str] = None
 
     # ---------- lifecycle ----------
 
     def on_train_start(self, full_cfg: Dict[str, Any]):
-        """Pass the FULL YAML cfg (with data/env/trainer) so auto-eval can rebuild the env."""
         self.run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-        # Run + files
         self.run_dir = os.path.join(self.base_log_dir, self.run_mode, self.run_id)
         os.makedirs(self.run_dir, exist_ok=True)
         self.csv_path = os.path.join(self.run_dir, "train.csv")
         self.plot_path = os.path.join(self.run_dir, "train_plot.png")
         self.meta_path = os.path.join(self.run_dir, "meta.json")
 
-        # Checkpoints
         self.ckpt_dir = os.path.join(
             self.ckpt_cfg.base_dir, self.ckpt_cfg.run_mode, f"{self.ckpt_cfg.name}_{self.run_id}"
         )
         os.makedirs(self.ckpt_dir, exist_ok=True)
 
-        # TensorBoard
         if self.enable_tb:
             self.tb_dir = os.path.join(self.run_dir, "tb")
             os.makedirs(self.tb_dir, exist_ok=True)
@@ -95,13 +79,12 @@ class Callbacks:
             except Exception:
                 pass
 
-        # Meta snapshot
         self._start_ts = datetime.now().isoformat()
         meta = {
             "run_id": self.run_id,
             "mode": self.run_mode,
             "start_time": self._start_ts,
-            "cfg": full_cfg,               # store full config snapshot
+            "cfg": full_cfg,
             "config_path": self.config_path,
             "ckpt_dir": self.ckpt_dir,
             "tb_dir": self.tb_dir,
@@ -109,19 +92,15 @@ class Callbacks:
         with open(self.meta_path, "w", encoding="utf-8") as f:
             json.dump(meta, f, indent=2)
 
-        # Latest pointers
         write_latest_pointer("logs", self.run_mode, self.run_dir)
         write_latest_pointer("checkpoints", self.run_mode, self.ckpt_dir)
-
         self._csv_init_done = False
 
     def on_episode_end(self, ep: int, logs: Dict[str, Any], trainer) -> None:
-        # CSV
         row = {"episode": int(ep)}
         row.update({k: float(v) for k, v in logs.items()})
         self._csv_write(row)
 
-        # TensorBoard scalars
         if self.tb_writer is not None:
             self.tb_writer.add_scalar("train/total_loss", logs.get("loss", float("nan")), ep)
             self.tb_writer.add_scalar("train/policy_loss", logs.get("policy_loss", float("nan")), ep)
@@ -135,7 +114,6 @@ class Callbacks:
             except Exception:
                 pass
 
-        # Checkpoint save (rotate)
         path = os.path.join(self.ckpt_dir, f"{self.ckpt_cfg.name}_ep{ep:05d}.pt")
         state = {
             "episode": ep,
@@ -151,7 +129,6 @@ class Callbacks:
         os.replace(tmp, path)
         self._last_ckpt_path = path
 
-        # Prune old checkpoints
         files = sorted(
             f for f in os.listdir(self.ckpt_dir)
             if f.startswith(self.ckpt_cfg.name) and f.endswith(".pt")
@@ -164,7 +141,6 @@ class Callbacks:
                     pass
 
     def on_train_end(self, total_episodes: int):
-        # Update meta
         try:
             with open(self.meta_path, "r", encoding="utf-8") as f:
                 meta = json.load(f)
@@ -177,10 +153,8 @@ class Callbacks:
         with open(self.meta_path, "w", encoding="utf-8") as f:
             json.dump(meta, f, indent=2)
 
-        # Auto-eval into SAME run dir
         eval_json, eval_plot = self._auto_eval_safe()
 
-        # Log eval metrics to TensorBoard
         if self.tb_writer is not None and eval_json and os.path.exists(eval_json):
             try:
                 with open(eval_json, "r", encoding="utf-8") as f:
@@ -191,12 +165,10 @@ class Callbacks:
             except Exception:
                 pass
 
-        # Close TB
         if self.tb_writer is not None:
             self.tb_writer.flush()
             self.tb_writer.close()
 
-        # Global index row
         append_run_index({
             "run_id": self.run_id or "",
             "mode": self.run_mode,
@@ -224,7 +196,6 @@ class Callbacks:
         }
 
     def _csv_write(self, row: Dict[str, Any]):
-        """Append a row to train.csv (write header once)."""
         if not self.csv_path:
             return
         header = list(row.keys())
@@ -238,13 +209,11 @@ class Callbacks:
 
     def _auto_eval_safe(self):
         """
-        Programmatic evaluation; saves eval.json + eval_plot.png into run dir.
-        Works even if matplotlib/pandas are missing (JSON still saved).
+        Auto-eval using SAME model sizes as training, saved in meta["model"].
         """
         if not self._last_ckpt_path:
             return None, None
         try:
-            # Lazy imports
             import torch, numpy as np, yaml
             from trader.metrics.evaluate import compute_metrics
             from trader.data.providers.sim import SimProvider
@@ -252,15 +221,11 @@ class Callbacks:
             from trader.models.feature_lstm import FeatureLSTM
             from trader.models.policy_lstm import RecurrentActorCritic
 
-            # Load full cfg (prefer meta snapshot; fallback to config_path)
             with open(self.meta_path, "r", encoding="utf-8") as f:
                 meta = json.load(f)
             cfg = meta.get("cfg", {})
-            if "data" not in cfg and self.config_path and os.path.exists(self.config_path):
-                with open(self.config_path, "r") as cf:
-                    cfg = yaml.safe_load(cf)
+            model_cfg = meta.get("model", {})  # <-- contains hidden/obs/action
 
-            # Rebuild env like training
             provider = SimProvider(
                 symbols=cfg["data"]["symbols"],
                 days=cfg["data"]["days"],
@@ -274,18 +239,19 @@ class Callbacks:
                 turbulence_cfg=cfg["env"]["turbulence"],
                 max_positions=cfg["env"]["max_positions"],
             )
-            obs_dim = provider.observation_spec()["feature_dim"]
 
-            # Models (small by default for eval CPU safety)
-            feature = FeatureLSTM(input_dim=obs_dim, hidden_dim=16)
-            policy = RecurrentActorCritic(obs_embed_dim=16, action_dim=env.action_space.shape[0], hidden=16)
+            # Use SAME sizes; fallback to conservative defaults if missing
+            hidden = int(model_cfg.get("hidden", 16))
+            obs_dim = int(model_cfg.get("obs_dim", provider.observation_spec()["feature_dim"]))
+            act_dim = int(model_cfg.get("action_dim", env.action_space.shape[0]))
 
-            # Load checkpoint
+            feature = FeatureLSTM(input_dim=obs_dim, hidden_dim=hidden)
+            policy = RecurrentActorCritic(obs_embed_dim=hidden, action_dim=act_dim, hidden=hidden)
+
             state = torch.load(self._last_ckpt_path, map_location="cpu")
             feature.load_state_dict(state["feature"])
             policy.load_state_dict(state["policy"])
 
-            # Deterministic eval
             def eval_episode():
                 obs, _ = env.reset()
                 equity = [env.nav]
@@ -293,7 +259,7 @@ class Callbacks:
                 h1 = h2 = None
                 done = False
                 steps = 0
-                while not done and steps < 10_000:
+                while not done and steps < 10000:
                     x = torch.tensor(obs, dtype=torch.float32).view(1, 1, -1)
                     z, h1 = feature(x, h1)
                     mu, std, v, h2 = policy(z, h2)
@@ -312,12 +278,10 @@ class Callbacks:
 
             metrics = compute_metrics(R, EQ, trade_sizes=TR)
 
-            # Save JSON
             eval_json_path = os.path.join(self.run_dir, "eval.json")
             with open(eval_json_path, "w", encoding="utf-8") as f:
                 json.dump(metrics.to_dict(), f, indent=2)
 
-            # Try to save equity plot
             eval_plot_path = os.path.join(self.run_dir, "eval_plot.png")
             try:
                 import matplotlib.pyplot as plt
@@ -325,20 +289,19 @@ class Callbacks:
                 eq = np.array(metrics.equity_curve, dtype=float)
                 if len(eq) > 1:
                     plt.figure(figsize=(10, 5))
-                    plt.plot(eq / (eq[0] + 1e-8) - 1.0)
+                    base = eq[0] + 1e-8
+                    plt.plot(eq / base - 1.0)
                     plt.title(f"Equity Curve (normalized) — {self.run_id}")
                     plt.xlabel("Step"); plt.ylabel("Return")
                     plt.grid(True, linestyle="--", alpha=0.5)
-                    plt.tight_layout(); plt.savefig(eval_plot_path, dpi=150)
-                    plt.close()
+                    plt.tight_layout(); plt.savefig(eval_plot_path, dpi=150); plt.close()
             except Exception:
                 eval_plot_path = None
 
-            # Update meta with eval pointers/metrics
+            # update meta with pointers
             try:
                 with open(self.meta_path, "r", encoding="utf-8") as f:
                     meta2 = json.load(f)
-                meta2["eval"] = metrics.to_dict()
                 meta2["eval_json"] = eval_json_path
                 meta2["eval_plot"] = eval_plot_path
                 with open(self.meta_path, "w", encoding="utf-8") as f:

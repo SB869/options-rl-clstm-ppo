@@ -1,5 +1,7 @@
+# apps/train_cli.py
 from __future__ import annotations
 import argparse
+import json
 import yaml
 import torch
 
@@ -47,7 +49,11 @@ def main(config_path: str, mode: str, auto_eval_episodes: int = 3, enable_tb: bo
     # --- Model sizing: larger on GPU, smaller on CPU ---
     hid = 128 if device.type == "cuda" else 16
     feature = FeatureLSTM(input_dim=obs_spec["feature_dim"], hidden_dim=hid).to(device)
-    policy = RecurrentActorCritic(obs_embed_dim=hid, action_dim=env.action_space.shape[0], hidden=hid).to(device)
+    policy = RecurrentActorCritic(
+        obs_embed_dim=hid,
+        action_dim=env.action_space.shape[0],
+        hidden=hid
+    ).to(device)
 
     # --- Callbacks: TB + auto-eval + run registry ---
     callbacks = Callbacks(
@@ -59,6 +65,21 @@ def main(config_path: str, mode: str, auto_eval_episodes: int = 3, enable_tb: bo
         enable_tb=enable_tb,
     )
     callbacks.on_train_start(cfg)
+
+    # ➜ Immediately store model hyperparams into meta.json (so eval uses SAME sizes)
+    paths = callbacks.get_run_paths()
+    try:
+        with open(paths["meta"], "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        meta["model"] = {
+            "hidden": hid,
+            "obs_dim": int(obs_spec["feature_dim"]),
+            "action_dim": int(env.action_space.shape[0]),
+        }
+        with open(paths["meta"], "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2)
+    except Exception:
+        pass
 
     # --- Trainer (passes device/AMP options) ---
     amp_dtype = (cfg["trainer"].get("amp_dtype", "bfloat16") if "trainer" in cfg else "bfloat16")

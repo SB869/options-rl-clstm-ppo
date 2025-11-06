@@ -1,0 +1,61 @@
+{
+  "run_id": "20251106_092011",
+  "mode": "live",
+  "start_time": "2025-11-06T09:20:11.441423",
+  "cfg": {
+    "seed": 123,
+    "data": {
+      "symbols": [
+        "SPY"
+      ],
+      "days": 250
+    },
+    "env": {
+      "option": {
+        "kind": "call",
+        "dte_start": 30
+      },
+      "costs": {
+        "commission_per_contract": 0.65,
+        "spread_bps": 15,
+        "scale": "1e-4"
+      },
+      "turbulence": {
+        "window": 60,
+        "pct": 0.9,
+        "enabled": true
+      },
+      "max_positions": 20
+    },
+    "trainer": {
+      "episodes": 100,
+      "gamma": 0.99,
+      "gae_lambda": 0.95,
+      "clip_eps": 0.2,
+      "value_coef": 0.5,
+      "entropy_coef": 0.01,
+      "lr": 0.0003,
+      "batch_steps": 2048,
+      "epochs": 10,
+      "minibatch_size": 256,
+      "value_clip": 0.2,
+      "target_kl": 0.02,
+      "entropy_target": null,
+      "device": "cuda",
+      "amp_dtype": "bfloat16"
+    }
+  },
+  "config_path": "configs/h200_train.yaml",
+  "ckpt_dir": "checkpoints/live/sim_20251106_092011",
+  "tb_dir": "logs/live/20251106_092011/tb",
+  "model": {
+    "hidden": 128,
+    "obs_dim": 8,
+    "action_dim": 1
+  },
+  "end_time": "2025-11-06T09:25:57.880783",
+  "episodes": 100,
+  "last_checkpoint": "checkpoints/live/sim_20251106_092011/sim_ep00100.pt",
+  "eval_json": "logs/live/20251106_092011/eval.json",
+  "eval_plot": "logs/live/20251106_092011/eval_plot.png"
+}

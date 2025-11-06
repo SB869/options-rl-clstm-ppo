@@ -1,43 +1,33 @@
+# src/trader/models/policy_lstm.py
+from __future__ import annotations
 import torch
 import torch.nn as nn
-from trader.models.action_heads import TanhHead
-
 
 class RecurrentActorCritic(nn.Module):
-    """
-    Paper's second LSTM: recurrent policy/value head.
-    Takes the embedded sequence from FeatureLSTM and applies an LSTM,
-    then produces:
-      - policy (mu, std) via TanhHead
-      - value V(s)
-
-    Inputs:
-      z_seq: (B, T, E)   sequence of embeddings
-      h: optional ((h, c)) hidden state for the policy LSTM
-
-    Returns:
-      mu:   (B, A)
-      std:  (B, A)
-      v:    (B, 1)
-      h:    new hidden state tuple
-    """
-
-    def __init__(self, obs_embed_dim: int, action_dim: int, hidden: int = 64, num_layers: int = 1, dropout: float = 0.0):
+    def __init__(self, obs_embed_dim: int, action_dim: int, hidden: int = 128, init_log_std: float = -0.5):
         super().__init__()
-        self.lstm = nn.LSTM(
-            input_size=obs_embed_dim,
-            hidden_size=hidden,
-            num_layers=num_layers,
-            dropout=dropout if num_layers > 1 else 0.0,
-            batch_first=True,
-        )
-        self.pi = TanhHead(hidden, action_dim)
+        self.lstm = nn.LSTM(input_size=obs_embed_dim, hidden_size=hidden, batch_first=True)
+        self.mu = nn.Linear(hidden, action_dim)
         self.v = nn.Linear(hidden, 1)
 
-    def forward(self, z_seq, h=None):
-        # z_seq: (B, T, E)
-        out, h = self.lstm(z_seq, h) if h is not None else self.lstm(z_seq)
-        h_t = out[:, -1, :]            # (B, H) last timestep
-        mu, std = self.pi(h_t)         # (B, A), (B, A)
-        v = self.v(h_t)                # (B, 1)
-        return mu, std, v, h
+        # Learnable log std (diagonal Gaussian)
+        self.log_std = nn.Parameter(torch.full((action_dim,), init_log_std))
+
+        # Mild init
+        nn.init.orthogonal_(self.lstm.weight_ih_l0, gain=1.0)
+        nn.init.orthogonal_(self.lstm.weight_hh_l0, gain=1.0)
+        nn.init.zeros_(self.lstm.bias_ih_l0)
+        nn.init.zeros_(self.lstm.bias_hh_l0)
+        nn.init.orthogonal_(self.mu.weight, gain=0.01)
+        nn.init.zeros_(self.mu.bias)
+        nn.init.orthogonal_(self.v.weight, gain=1.0)
+        nn.init.zeros_(self.v.bias)
+
+    def forward(self, z, state=None):
+        # z: (B,T,E)
+        y, state = self.lstm(z, state)        # (B,T,H)
+        h = y[:, -1, :]                        # use last step in sequence
+        mu = self.mu(h)                        # (B,A)
+        std = torch.exp(self.log_std).expand_as(mu)
+        v = self.v(h)                          # (B,1)
+        return mu, std, v, state
