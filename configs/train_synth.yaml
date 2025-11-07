@@ -1,0 +1,37 @@
+seed: 123
+
+data:
+  provider: "synth"         # label only; your loader can ignore this if it just scans a cache path
+  cache_dir: "data/synth"   # point training to the synthetic cache root
+  symbols: [SPY]
+  timeframe: "1Min"
+
+env:
+  option:
+    kind: call
+    dte_start: 14
+  costs:
+    commission_per_contract: 0.65
+    spread_bps: 15
+    scale: 1e-4
+  turbulence:
+    window: 60
+    pct: 0.9
+    enabled: true
+  max_positions: 20
+
+trainer:
+  episodes: 50
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_eps: 0.2
+  value_coef: 0.5
+  entropy_coef: 0.01
+  lr: 3.0e-4
+  batch_steps: 2048
+  epochs: 10
+  minibatch_size: 256
+  value_clip: 0.2
+  target_kl: 0.03
+  device: "cuda"
+  amp_dtype: "bfloat16"

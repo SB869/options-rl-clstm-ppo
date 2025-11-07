@@ -9,20 +9,34 @@ description = "CLSTM-PPO options trading scaffold (paper-faithful + options adap
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+  # Core + scientific stack
   "torch>=2.2",
   "numpy>=1.24",
   "pandas>=2.1",
-  "gymnasium>=0.29",
   "scipy>=1.11",
-  "tyro>=0.7.3",
-  "pyyaml>=6.0",
-  "tqdm>=4.66",
-  "requests>=2.31",
   "pyarrow>=15.0",
+  "pyyaml>=6.0",
+  "requests>=2.31",
   "python-dateutil>=2.8.2",
   "pytz>=2024.1",
   "tenacity>=8.2.3",
   "python-dotenv>=1.0.1",
+  "tqdm>=4.66",
+
+  # RL / env
+  "gymnasium>=0.29",
+
+  # Market / data
+  "alpaca-py>=0.13.0",
+  "pandas-market-calendars>=4.0.0",
+
+  # Visualization / monitoring
+  "tensorboard>=2.16",
+
+  # Dev utilities
+  "black>=24.3.0",
+  "ruff>=0.5.0",
+  "pytest>=8.2.0",
 ]
 
 [tool.setuptools]
@@ -33,7 +47,8 @@ where = ["src"]
 
 [tool.black]
 line-length = 100
+target-version = ["py310"]
 
 [tool.ruff]
 line-length = 100
-select = ["E","F","I","UP"]
+select = ["E", "F", "I", "UP"]

@@ -1,0 +1,18 @@
+synth:
+  underlying: "SPY"
+  underlying_parquet: ""     # leave blank to auto-discover latest SPY_underlying_*.parquet in data/alpaca/SPY/
+  outdir: "data/synth/SPY"
+
+  dte_list: [7, 14, 21, 30]
+  moneyness_pct: [0.85, 0.9, 0.95, 1.0, 1.05, 1.1, 1.15]
+
+  ewma_halflife_minutes: 120
+  min_annual_vol: 0.10
+  max_annual_vol: 1.50
+
+  risk_free_rate: 0.02
+  timezone: "America/New_York"
+  rth_only: true
+
+  write_chain: true
+  symbol_prefix: "SPY"
