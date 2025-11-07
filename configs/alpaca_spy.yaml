@@ -10,10 +10,15 @@ data:
   dte_max: 30
   strikes_around: 5             # ATM ±N strikes
   cache_dir: "data/alpaca"      # Parquet cache root
-  backfill: false               # set true for first run to pull + cache
+  backfill: true                # enable first run to pull + cache
   fetch_iv: false               # Alpaca greeks coverage varies; keep false initially
   batch_size: 100               # symbols per bars request
   rate_limit_sleep: 0.5         # seconds between API calls
+
+  # Helpful defaults for Alpaca options when used by other parts of your pipeline
+  feed: "opra"                  # OPRA = options tape
+  rth_only: true                # fetch during regular trading hours
+  timezone: "America/New_York"  # session calendar tz
 
 env:
   option:
@@ -44,3 +49,27 @@ trainer:
   target_kl: 0.03
   device: "cuda"
   amp_dtype: "bfloat16"
+
+# Backfill block used by apps/backfill_alpaca.py
+backfill:
+  underlying: "SPY"
+  start_date: "2024-08-01"
+  end_date: "2024-11-01"
+  outdir: "data/alpaca/SPY"
+
+  # Data resolution & feed
+  timeframe: "1Min"
+  feed: "opra"                  # critical for options bars
+
+  # Chain filters (mirrors data.* settings but uses moneyness, which is more robust)
+  atm_moneyness_pct: 0.25       # keep strikes within ±15% of spot0
+  min_dte: 3                    # mirrors data.dte_min
+  max_dte: 45                   # mirrors data.dte_max
+
+  # Sessions
+  rth_only: true
+  timezone: "America/New_York"
+
+  # Outputs
+  write_chain: true
+  write_underlying: true
