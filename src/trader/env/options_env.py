@@ -11,7 +11,7 @@ class OptionsTradingEnv(gym.Env):
     """
     Single-instrument options-like environment.
 
-    - Observation: provider returns an 8-D vector (see SimProvider) + metadata.
+    - Observation: provider returns an 8-D vector + metadata.
     - Action: continuous a ∈ [-1, 1], mapped to target contracts ∈ [-max_positions, +max_positions].
     - Costs: commission per contract + spread slippage (bps of notional).
     - Reward: (ΔPortfolio − costs) * scale  -> implemented as (ΔNAV) * scale since costs debit cash.
@@ -38,7 +38,7 @@ class OptionsTradingEnv(gym.Env):
         self.max_positions = int(max_positions)
         self.turbulence = TurbulenceGate(**turbulence_cfg)
 
-        # Action/obs spaces (matches SimProvider feature_dim=8)
+        # Action/obs spaces (8-D features)
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(8,), dtype=np.float32)
 
@@ -59,8 +59,13 @@ class OptionsTradingEnv(gym.Env):
 
     def reset(self, *, seed: int | None = None, options=None):
         data = self.provider.reset()
-        obs = np.asarray(data["x"], dtype=np.float32)
-        S = float(data.get("S", 100.0))
+        # Safety: tolerate providers that return None
+        if not isinstance(data, dict) or "x" not in data:
+            obs = np.zeros(self.observation_space.shape, dtype=np.float32)
+            S = 100.0
+        else:
+            obs = np.asarray(data["x"], dtype=np.float32)
+            S = float(data.get("S", 100.0))
 
         self.position = 0.0
         self.cash = 1_000_000.0
@@ -76,10 +81,16 @@ class OptionsTradingEnv(gym.Env):
         a = float(np.clip(a[0], -1.0, 1.0))
 
         data = self.provider.step()
-        obs = np.asarray(data["x"], dtype=np.float32)
-        terminated = bool(data.get("done", False))
+        if not isinstance(data, dict) or "x" not in data:
+            obs = np.zeros(self.observation_space.shape, dtype=np.float32)
+            terminated = True
+            S = 100.0
+        else:
+            obs = np.asarray(data["x"], dtype=np.float32)
+            terminated = bool(data.get("done", False))
+            S = float(data.get("S", 100.0))
+
         truncated = False
-        S = float(data.get("S", 100.0))
 
         # current synthetic option price from obs
         opt_price = self._option_price_from_obs(obs, S)

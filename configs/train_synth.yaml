@@ -1,8 +1,8 @@
 seed: 123
 
 data:
-  provider: "synth"         # label only; your loader can ignore this if it just scans a cache path
-  cache_dir: "data/synth"   # point training to the synthetic cache root
+  provider: "synth"
+  cache_dir: "data/synth"
   symbols: [SPY]
   timeframe: "1Min"
 
