@@ -24,14 +24,27 @@ trainer:
   episodes: 50
   gamma: 0.99
   gae_lambda: 0.95
-  clip_eps: 0.2
-  value_coef: 0.5
-  entropy_coef: 0.01
-  lr: 3.0e-4
+
+  # Smaller, safer updates
+  lr: 7.0e-5          # ↓ from 1e-4
+  clip_eps: 0.07      # ↓ from 0.10
+  epochs: 3           # ↓ from 5
+  minibatch_size: 1024
   batch_steps: 2048
-  epochs: 10
-  minibatch_size: 256
+
+  # Regularization
+  value_coef: 0.5
+  entropy_coef: 0.005   # slightly lower while KL stabilizes
   value_clip: 0.2
-  target_kl: 0.03
+  target_kl: 0.02       # tighter target
+
+  # Stabilizers the trainer uses
+  max_grad_norm: 0.5
+  kl_stop_multiplier: 1.2   # stop much earlier
+  kl_adapt: true
+  kl_beta: 1.0
+  kl_beta_inc: 1.5
+  kl_beta_dec: 0.75
+
   device: "cuda"
   amp_dtype: "bfloat16"
