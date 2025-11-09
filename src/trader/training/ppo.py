@@ -1,4 +1,3 @@
-# src/trader/training/ppo.py
 from __future__ import annotations
 from typing import Dict, Any, Tuple
 
@@ -16,7 +15,8 @@ def _sum_log_one_minus_a2(a: torch.Tensor) -> torch.Tensor:
     Sum over action dims: log(1 - a^2 + eps).
     For a = tanh(z): log p(a) = log p(z) - sum log(1 - a^2).
     """
-    eps = 1e-6
+    # Slightly larger eps for bf16 safety
+    eps = 1e-5
     return torch.log(1 - a.pow(2) + eps).sum(dim=-1)
 
 
@@ -31,11 +31,10 @@ class PPOTrainer:
     """
     PPO trainer with:
       - recurrent feature & policy nets (provided by caller)
-      - GAE advantages
+      - GAE advantages (masked across episode boundaries)
       - minibatch SGD with value clipping
       - KL target with adaptive penalty and per-minibatch early stop
-      - robust numerics for tanh-squashed Gaussians
-      - AMP + grad clipping
+      - AMP (+ fp32 islands for fragile logprob math) + grad clipping
     """
 
     def __init__(
@@ -97,9 +96,10 @@ class PPOTrainer:
         else:
             self.amp_dtype = torch.float32
 
+        # NOTE: GradScaler for fp16 only. bf16 does not use it.
         self.scaler = GradScaler(
             "cuda",
-            enabled=(self.device.type == "cuda" and self.amp_dtype != torch.float32),
+            enabled=(self.device.type == "cuda" and self.amp_dtype == torch.float16),
         )
 
     @staticmethod
@@ -113,32 +113,37 @@ class PPOTrainer:
         Recurrent states are reset across episode boundaries.
         """
         obs, _ = self.env.reset()
-        traj = {k: [] for k in ["obs", "act", "rew", "val", "logp"]}
+        traj = {k: [] for k in ["obs", "act", "rew", "val", "logp", "done"]}
         h_feat = None
         h_pol = None
 
         for _ in range(steps):
             x = torch.tensor(obs, dtype=torch.float32, device=self.device).view(1, 1, -1)
 
+            # Run networks under AMP...
             with autocast("cuda", enabled=(self.device.type == "cuda"), dtype=self.amp_dtype):
                 z, h_feat = self.feature(x, h_feat)
                 mu, std, v, h_pol = self.policy(z, h_pol)
 
-                base = torch.distributions.Normal(mu, std)
-                z_samp = base.rsample()
-                a = torch.tanh(z_samp)
+            # ...but compute distribution/logp/Jacobian in fp32 for stability
+            mu32 = mu.float()
+            std32 = std.float()
+            base = torch.distributions.Normal(mu32, std32)
+            z_samp = base.rsample()
+            a = torch.tanh(z_samp)  # action in [-1, 1]
 
-                base_logp = base.log_prob(z_samp).sum(dim=-1)
-                # CORRECT sign: subtract tanh-Jacobian term
-                logp = base_logp - _sum_log_one_minus_a2(a)
+            base_logp = base.log_prob(z_samp).sum(dim=-1)
+            # correct sign: subtract tanh-Jacobian term
+            logp = base_logp - _sum_log_one_minus_a2(a.float())
 
             nxt, r, done, _, _ = self.env.step(a.detach().view(-1).cpu().numpy())
 
             traj["obs"].append(obs)
             traj["act"].append(a.detach().view(-1).cpu().numpy())
             traj["rew"].append(float(r))
-            traj["val"].append(float(v.item()))
-            traj["logp"].append(float(logp.item()))
+            traj["val"].append(float(v.float().item()))
+            traj["logp"].append(float(logp.float().item()))
+            traj["done"].append(bool(done))
 
             obs = nxt
             if done:
@@ -151,17 +156,21 @@ class PPOTrainer:
         return traj
 
     # ---------------- gae ----------------
-    def _gae(self, rew: torch.Tensor, val: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _gae(self, rew: torch.Tensor, val: torch.Tensor, done: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        GAE with episode masking. 'done' is 1.0 at terminal, 0.0 otherwise.
+        """
         with torch.no_grad():
-            v_next = torch.cat([val[1:], val[-1:]])
+            not_done = 1.0 - done
+            v_next = torch.cat([val[1:], val[-1:]]) * not_done + 0.0 * done
             deltas = rew + self.gamma * v_next - val
             adv = torch.zeros_like(rew)
             gae = 0.0
             for t in reversed(range(len(rew))):
-                gae = deltas[t] + self.gamma * self.lam * gae
+                gae = deltas[t] + self.gamma * self.lam * gae * not_done[t]
                 adv[t] = gae
             ret = adv + val
-        # sanitize
+        # sanitize + normalize
         adv = torch.nan_to_num(adv, nan=0.0, posinf=0.0, neginf=0.0)
         ret = torch.nan_to_num(ret, nan=0.0, posinf=0.0, neginf=0.0)
         adv = (adv - adv.mean()) / (adv.std(unbiased=False) + 1e-8)
@@ -169,10 +178,15 @@ class PPOTrainer:
 
     # ---------------- forward over batch ----------------
     def _forward_batch(self, obs_tensor: torch.Tensor, act: torch.Tensor):
+        """
+        Returns a Normal distribution (mu,std) constructed in fp32, and v_pred.
+        """
         with autocast("cuda", enabled=(self.device.type == "cuda"), dtype=self.amp_dtype):
             z, _ = self.feature(obs_tensor)                 # (T,1,E)
             mu, std, v_pred, _ = self.policy(z)            # (T,A),(T,A),(T,1)
-            base = torch.distributions.Normal(mu.view_as(act), std.view_as(act))
+
+        # Build distribution in fp32 for numerics
+        base = torch.distributions.Normal(mu.float().view_as(act), std.float().view_as(act))
         return base, v_pred.squeeze(-1)
 
     # ---------------- utils ----------------
@@ -181,8 +195,14 @@ class PPOTrainer:
 
     # ---------------- ppo update ----------------
     def _update(self, traj: Dict[str, torch.Tensor]) -> Dict[str, float]:
-        rew, val, logp_old, act = traj["rew"], traj["val"], traj["logp"], traj["act"]
-        adv, ret = self._gae(rew, val)
+        rew, val, logp_old, act, done = (
+            traj["rew"],
+            traj["val"],
+            traj["logp"],
+            traj["act"],
+            traj["done"],
+        )
+        adv, ret = self._gae(rew, val, done)
 
         # (T,1,D) for recurrence
         obs_tensor = traj["obs"].float().view(-1, 1, traj["obs"].shape[-1])
@@ -201,40 +221,45 @@ class PPOTrainer:
 
                 base, v_pred = self._forward_batch(obs_tensor[mb], act[mb])
 
-                # robust atanh reconstruction of pre-tanh action
-                a = act[mb].clamp(-0.999999, 0.999999)
+                # robust atanh reconstruction of pre-tanh action (fp32)
+                a = act[mb].clamp(-0.999999, 0.999999).float()
                 z_recon = torch.atanh(a)
 
-                with autocast("cuda", enabled=(self.device.type == "cuda"), dtype=self.amp_dtype):
-                    base_logp = base.log_prob(z_recon).sum(dim=-1)
-                    # must match rollout: subtract correction
-                    logp = base_logp - _sum_log_one_minus_a2(a)
+                # compute logp in fp32 (outside autocast for stability)
+                base_logp = base.log_prob(z_recon).sum(dim=-1).float()
+                logp = base_logp - _sum_log_one_minus_a2(a)
 
-                    # sanitize old logp and compute safe ratio
-                    lpo = torch.nan_to_num(logp_old[mb], nan=0.0, posinf=0.0, neginf=0.0)
-                    log_ratio = torch.clamp(logp - lpo, min=-20.0, max=20.0)  # avoid overflow
-                    ratio = torch.exp(log_ratio)
+                # If old log-probs are non-finite in this minibatch, skip it safely
+                lpo_raw = logp_old[mb]
+                if not torch.isfinite(lpo_raw).all():
+                    self.log.warning("Skipping minibatch due to non-finite old log-probs.")
+                    continue
+                lpo = lpo_raw.float()
 
-                    surr1 = ratio * adv[mb]
-                    surr2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * adv[mb]
-                    policy_loss = -torch.min(surr1, surr2).mean()
+                # safe ratio in log space
+                log_ratio = torch.clamp(logp - lpo, min=-20.0, max=20.0)
+                ratio = torch.exp(log_ratio)
 
-                    approx_kl = self._compute_approx_kl(lpo, logp)
-                    if self.kl_adapt:
-                        policy_loss = policy_loss + self.kl_beta * approx_kl
+                surr1 = ratio * adv[mb]
+                surr2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * adv[mb]
+                policy_loss = -torch.min(surr1, surr2).mean()
 
-                    # value loss with clip
-                    v_pred = torch.nan_to_num(v_pred, nan=0.0, posinf=0.0, neginf=0.0)
-                    v_clip = val[mb] + torch.clamp(v_pred - val[mb], -self.value_clip, self.value_clip)
-                    value_loss = 0.5 * torch.max(
-                        (ret[mb] - v_pred).pow(2),
-                        (ret[mb] - v_clip).pow(2),
-                    ).mean()
+                approx_kl = self._compute_approx_kl(lpo, logp)
+                if self.kl_adapt:
+                    policy_loss = policy_loss + self.kl_beta * approx_kl
 
-                    # base entropy (pre-tanh) is a reasonable proxy
-                    entropy = base.entropy().sum(dim=-1).mean()
+                # value loss with clip
+                v_pred = torch.nan_to_num(v_pred, nan=0.0, posinf=0.0, neginf=0.0)
+                v_clip = val[mb] + torch.clamp(v_pred - val[mb], -self.value_clip, self.value_clip)
+                value_loss = 0.5 * torch.max(
+                    (ret[mb] - v_pred).pow(2),
+                    (ret[mb] - v_clip).pow(2),
+                ).mean()
 
-                    loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy
+                # base entropy (pre-tanh) proxy (fp32)
+                entropy = base.entropy().sum(dim=-1).mean()
+
+                loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy
 
                 # skip non-finite minibatches
                 if not torch.isfinite(loss):
@@ -242,7 +267,7 @@ class PPOTrainer:
                     continue
 
                 # per-minibatch KL guard BEFORE optimizer step
-                if self.target_kl and approx_kl > self.target_kl * self.kl_stop_multiplier:
+                if self.target_kl and approx_kl >= self.target_kl * self.kl_stop_multiplier:
                     kl_tripped = True
                     break
 
@@ -270,6 +295,11 @@ class PPOTrainer:
                 clipfrac = (torch.abs(ratio - 1.0) > self.clip_eps).float().mean()
                 running_clipfrac.append(clipfrac.detach())
 
+                # Extra safety: if many samples are clipped, stop updates this epoch
+                if clipfrac > 0.8:
+                    kl_tripped = True
+                    break
+
                 # optional entropy target nudging
                 if self.entropy_target is not None:
                     ent_err = float(entropy.item()) - float(self.entropy_target)
@@ -287,6 +317,7 @@ class PPOTrainer:
                 mean_kl = torch.stack(running_kl).mean()
                 mean_clipfrac = torch.stack(running_clipfrac).mean()
             else:
+                # If all minibatches were skipped or KL-tripped immediately, set conservative stats
                 mean_kl = torch.tensor(self.target_kl * self.kl_stop_multiplier, device=self.device)
                 mean_clipfrac = torch.tensor(1.0, device=self.device)
 

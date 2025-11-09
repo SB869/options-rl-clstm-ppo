@@ -36,7 +36,6 @@ def _make_provider(cfg: dict):
         from trader.data.providers.synth import SynthProvider  # lazy import
         return SynthProvider(data_cfg)
 
-    # default: sim (synthetic-in-memory market)
     if prov_name == "sim":
         from trader.data.providers.sim import SimProvider  # lazy import
         return SimProvider(
@@ -64,6 +63,12 @@ def main(config_path: str, mode: str, auto_eval_episodes: int = 3, enable_tb: bo
     device = torch.device("cuda" if use_cuda else "cpu")
     log.info(f"Using device: {device}")
 
+    # Slightly safer default math precision; harmless on CPU
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
+
     # --- Provider selection (lazy imports inside) ---
     provider = _make_provider(cfg)
     prov_name = str((cfg.get("data") or {}).get("provider", "sim")).lower()
@@ -76,7 +81,7 @@ def main(config_path: str, mode: str, auto_eval_episodes: int = 3, enable_tb: bo
         max_positions=cfg["env"]["max_positions"],
     )
 
-    # NOTE: Instead of provider.observation_spec(), ask the env for the true obs dim.
+    # Ask the env for the true obs dim
     obs_dim = int(env.observation_space.shape[-1])
 
     # --- Model sizing ---

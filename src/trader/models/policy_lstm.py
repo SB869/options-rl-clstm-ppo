@@ -1,3 +1,4 @@
+# src/trader/models/policy_lstm.py
 from __future__ import annotations
 import torch
 import torch.nn as nn
@@ -23,14 +24,16 @@ class RecurrentActorCritic(nn.Module):
         nn.init.zeros_(self.v.bias)
 
     def forward(self, z, state=None):
-        y, state = self.lstm(z, state)        # (B,T,H)
+        # z: (B,T,E)
+        y, state = self.lstm(z, state) if state is not None else self.lstm(z)  # (B,T,H)
         h = y[:, -1, :]                       # (B,H)
         mu = self.mu(h)                       # (B,A)
 
-        # Sanitize + clamp log_std before exp to avoid NaNs/inf
-        ls = torch.nan_to_num(self.log_std, nan=-1.0, posinf=0.0, neginf=-3.0)
+        # Compute std in fp32 for numerical stability, then match dtype/device of mu
+        ls = self.log_std.float()
+        ls = torch.nan_to_num(ls, nan=-1.0, posinf=0.0, neginf=-3.0)
         ls = torch.clamp(ls, min=-3.0, max=0.0)          # std in ~[0.05, 1.0]
-        std = torch.exp(ls).expand_as(mu)
+        std = torch.exp(ls).to(dtype=mu.dtype, device=mu.device).expand_as(mu)
 
         v = self.v(h)                          # (B,1)
         return mu, std, v, state
