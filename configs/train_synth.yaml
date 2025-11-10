@@ -1,3 +1,5 @@
+# configs/train_synth.yaml
+
 seed: 123
 
 data:
@@ -20,27 +22,32 @@ env:
     enabled: true
   max_positions: 20
 
+# Model sizes now configurable
+model:
+  feature_hidden: 128
+  policy_hidden: 128
+
 trainer:
   episodes: 50
   gamma: 0.99
   gae_lambda: 0.95
 
-  # Smaller, safer updates
-  lr: 7.0e-5          # ↓ from 1e-4
-  clip_eps: 0.07      # ↓ from 0.10
-  epochs: 3           # ↓ from 5
+  # Safer update sizes
+  lr: 3.0e-5          # ↓ from 7e-5
+  clip_eps: 0.05      # ↓ from 0.07
+  epochs: 3
   minibatch_size: 1024
   batch_steps: 2048
 
   # Regularization
-  value_coef: 0.5
-  entropy_coef: 0.005   # slightly lower while KL stabilizes
+  value_coef: 0.7     # ↑ from 0.5 (stabilize critic)
+  entropy_coef: 0.007 # ↑ from 0.005 (steady exploration)
   value_clip: 0.2
-  target_kl: 0.02       # tighter target
+  target_kl: 0.010    # ↓ from 0.02
+  kl_stop_multiplier: 1.0  # ↓ from 1.2 (stop earlier when KL hits target)
 
-  # Stabilizers the trainer uses
+  # KL adaptation
   max_grad_norm: 0.5
-  kl_stop_multiplier: 1.2   # stop much earlier
   kl_adapt: true
   kl_beta: 1.0
   kl_beta_inc: 1.5
@@ -48,3 +55,27 @@ trainer:
 
   device: "cuda"
   amp_dtype: "bfloat16"
+
+  # ---- Stability knobs ----
+  stability:
+    # math / numerics
+    jacobian_eps: 1.0e-5       # eps in log(1 - a^2 + eps)
+    atanh_clip: 0.999999       # clamp for atanh(action)
+    log_ratio_clip: 20.0       # clamp for log(new/old) before exp
+
+    # safety guards
+    kl_beta_floor: 1.0e-3      # ↑ from 1e-4 — keep KL penalty meaningful
+    clipfrac_tripwire: 0.55    # ↓ from 0.80 — stop epoch when many samples clip
+
+    # losses / scaling
+    use_huber_value: true      # Huber for value loss
+    huber_delta: 1.0
+    scale_returns: true        # scale critic targets
+    scale_returns_mode: "zscore"  # "std" or "zscore"
+
+  # ---- Debug logging (see ppo.py) ----
+  debug:
+    enabled: true        # toggle detailed debug logs
+    episode_freq: 1      # write a debug CSV row every N episodes
+    write_csv: true      # write logs/local/<run>/debug_stats.csv
+    hist_k: 0            # reserved for future histogram dumps

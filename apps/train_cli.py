@@ -20,24 +20,20 @@ load_env()
 
 
 def _make_provider(cfg: dict):
-    """
-    Create a data provider based on cfg['data']['provider'].
-    Lazily imports provider modules so we don't import Alpaca on non-Alpaca runs.
-    """
     data_cfg = cfg.get("data") or {}
     env_cfg = cfg.get("env") or {}
     prov_name = str(data_cfg.get("provider", "sim")).lower()
 
     if prov_name == "alpaca":
-        from trader.data.providers.alpaca import AlpacaProvider  # lazy import
+        from trader.data.providers.alpaca import AlpacaProvider
         return AlpacaProvider(data_cfg)
 
     if prov_name in ("synth", "parquet"):
-        from trader.data.providers.synth import SynthProvider  # lazy import
+        from trader.data.providers.synth import SynthProvider
         return SynthProvider(data_cfg)
 
     if prov_name == "sim":
-        from trader.data.providers.sim import SimProvider  # lazy import
+        from trader.data.providers.sim import SimProvider
         return SimProvider(
             symbols=data_cfg["symbols"],
             days=data_cfg["days"],
@@ -57,44 +53,39 @@ def main(config_path: str, mode: str, auto_eval_episodes: int = 3, enable_tb: bo
     set_global_seed(cfg.get("seed", 42))
     log.info(f"Loaded config: {config_path} | mode={mode}")
 
-    # Select device
+    # Device
     dev_cfg = (cfg.get("trainer") or {}).get("device", "cuda")
     use_cuda = torch.cuda.is_available() and dev_cfg == "cuda"
     device = torch.device("cuda" if use_cuda else "cpu")
     log.info(f"Using device: {device}")
 
-    # Slightly safer default math precision; harmless on CPU
-    try:
-        torch.set_float32_matmul_precision("high")
-    except Exception:
-        pass
-
-    # --- Provider selection (lazy imports inside) ---
+    # Provider + env
     provider = _make_provider(cfg)
     prov_name = str((cfg.get("data") or {}).get("provider", "sim")).lower()
 
-    # --- Environment ---
     env = OptionsTradingEnv(
         provider=provider,
         costs=cfg["env"]["costs"],
         turbulence_cfg=cfg["env"]["turbulence"],
         max_positions=cfg["env"]["max_positions"],
     )
-
-    # Ask the env for the true obs dim
     obs_dim = int(env.observation_space.shape[-1])
 
-    # --- Model sizing ---
-    hid = 128 if device.type == "cuda" else 16
-    feature = FeatureLSTM(input_dim=obs_dim, hidden_dim=hid).to(device)
+    # Model sizes from config (so you can tune via YAML)
+    mcfg = (cfg.get("model") or {})
+    default_hidden = 128 if device.type == "cuda" else 16
+    feat_hidden = int(mcfg.get("feature_hidden", default_hidden))
+    pol_hidden = int(mcfg.get("policy_hidden", feat_hidden))
+
+    feature = FeatureLSTM(input_dim=obs_dim, hidden_dim=feat_hidden).to(device)
     policy = RecurrentActorCritic(
-        obs_embed_dim=hid,
+        obs_embed_dim=feat_hidden,
         action_dim=env.action_space.shape[0],
-        hidden=hid,
+        hidden=pol_hidden,
     ).to(device)
 
-    # --- Callbacks (TB, auto-eval, registry) ---
-    run_tag = prov_name  # tag checkpoints/logs by provider
+    # Callbacks
+    run_tag = prov_name
     callbacks = Callbacks(
         ckpt=CheckpointCfg(base_dir="checkpoints", name=run_tag, keep=3, run_mode=mode),
         base_log_dir="logs",
@@ -111,7 +102,8 @@ def main(config_path: str, mode: str, auto_eval_episodes: int = 3, enable_tb: bo
         with open(paths["meta"], "r", encoding="utf-8") as f:
             meta = json.load(f)
         meta["model"] = {
-            "hidden": hid,
+            "feature_hidden": feat_hidden,
+            "policy_hidden": pol_hidden,
             "obs_dim": obs_dim,
             "action_dim": int(env.action_space.shape[0]),
         }

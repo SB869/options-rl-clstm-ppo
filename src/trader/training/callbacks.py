@@ -5,7 +5,7 @@ import json
 import os
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from trader.utils.runs import append_run_index, write_latest_pointer
 
@@ -13,7 +13,7 @@ from trader.utils.runs import append_run_index, write_latest_pointer
 try:
     from torch.utils.tensorboard import SummaryWriter
 except Exception:
-    SummaryWriter = None
+    SummaryWriter = None  # type: ignore
 
 
 @dataclass
@@ -37,7 +37,7 @@ class Callbacks:
         self.ckpt_cfg = ckpt or CheckpointCfg(run_mode=run_mode)
         self.base_log_dir = base_log_dir
         self.run_mode = run_mode
-        self.auto_eval_episodes = int(auto_eval_episodes)
+        self.auto_eval_episodes = int(auto_eval_episodes or 0)
         self.config_path = config_path
         self.enable_tb = enable_tb and SummaryWriter is not None
 
@@ -153,7 +153,11 @@ class Callbacks:
         with open(self.meta_path, "w", encoding="utf-8") as f:
             json.dump(meta, f, indent=2)
 
-        eval_json, eval_plot = self._auto_eval_safe()
+        # ---- Auto-eval guard: skip cleanly if disabled ----
+        if self.auto_eval_episodes <= 0:
+            eval_json, eval_plot = None, None
+        else:
+            eval_json, eval_plot = self._auto_eval_safe()
 
         if self.tb_writer is not None and eval_json and os.path.exists(eval_json):
             try:
@@ -207,32 +211,61 @@ class Callbacks:
                 self._csv_init_done = True
             w.writerow(row)
 
-    def _auto_eval_safe(self):
+    # ---- provider factory used by safe auto-eval ----
+    def _make_provider_for_eval(self, cfg: Dict[str, Any]):
+        data_cfg = cfg.get("data") or {}
+        env_cfg = cfg.get("env") or {}
+        prov = str(data_cfg.get("provider", "sim")).lower()
+
+        if prov == "sim":
+            # require 'days' only for sim
+            if "days" not in data_cfg:
+                raise KeyError("data.days missing for sim provider during auto-eval.")
+            from trader.data.providers.sim import SimProvider  # lazy import
+            return SimProvider(
+                symbols=data_cfg["symbols"],
+                days=data_cfg["days"],
+                option_kind=env_cfg["option"]["kind"],
+                dte_start=env_cfg["option"]["dte_start"],
+                seed=cfg.get("seed", 42),
+            )
+        if prov in ("synth", "parquet"):
+            from trader.data.providers.synth import SynthProvider  # lazy import
+            return SynthProvider(data_cfg)
+        if prov == "alpaca":
+            from trader.data.providers.alpaca import AlpacaProvider  # lazy import
+            return AlpacaProvider(data_cfg)
+
+        raise ValueError(f"Unknown data provider for eval: {prov}")
+
+    def _auto_eval_safe(self) -> Tuple[Optional[str], Optional[str]]:
         """
-        Auto-eval using SAME model sizes as training, saved in meta["model"].
+        Auto-eval using SAME provider family as training (no hard-coded 'sim').
+        If anything fails, return (None, None) without raising.
         """
         if not self._last_ckpt_path:
             return None, None
+        if self.auto_eval_episodes <= 0:
+            return None, None
+
         try:
-            import torch, numpy as np, yaml
-            from trader.metrics.evaluate import compute_metrics
-            from trader.data.providers.sim import SimProvider
+            import torch
+            import numpy as np
+
             from trader.env.options_env import OptionsTradingEnv
             from trader.models.feature_lstm import FeatureLSTM
             from trader.models.policy_lstm import RecurrentActorCritic
+            from trader.metrics.evaluate import compute_metrics
 
+            # Read meta with training cfg
             with open(self.meta_path, "r", encoding="utf-8") as f:
                 meta = json.load(f)
-            cfg = meta.get("cfg", {})
-            model_cfg = meta.get("model", {})  # <-- contains hidden/obs/action
+            cfg = meta.get("cfg", {}) or {}
 
-            provider = SimProvider(
-                symbols=cfg["data"]["symbols"],
-                days=cfg["data"]["days"],
-                option_kind=cfg["env"]["option"]["kind"],
-                dte_start=cfg["env"]["option"]["dte_start"],
-                seed=cfg.get("seed", 42),
-            )
+            # Build the *right* provider for eval
+            provider = self._make_provider_for_eval(cfg)
+
+            # Env mirrors training env block
             env = OptionsTradingEnv(
                 provider=provider,
                 costs=cfg["env"]["costs"],
@@ -240,30 +273,32 @@ class Callbacks:
                 max_positions=cfg["env"]["max_positions"],
             )
 
-            # Use SAME sizes; fallback to conservative defaults if missing
-            hidden = int(model_cfg.get("hidden", 16))
-            obs_dim = int(model_cfg.get("obs_dim", provider.observation_spec()["feature_dim"]))
+            # Model sizes: support both new (feature_hidden/policy_hidden) and old ('hidden')
+            model_cfg = meta.get("model", {}) or {}
+            feat_hidden = int(model_cfg.get("feature_hidden", model_cfg.get("hidden", 16)))
+            pol_hidden = int(model_cfg.get("policy_hidden", feat_hidden))
+            obs_dim = int(model_cfg.get("obs_dim", env.observation_space.shape[-1]))
             act_dim = int(model_cfg.get("action_dim", env.action_space.shape[0]))
 
-            feature = FeatureLSTM(input_dim=obs_dim, hidden_dim=hidden)
-            policy = RecurrentActorCritic(obs_embed_dim=hidden, action_dim=act_dim, hidden=hidden)
+            feature = FeatureLSTM(input_dim=obs_dim, hidden_dim=feat_hidden)
+            policy = RecurrentActorCritic(obs_embed_dim=feat_hidden, action_dim=act_dim, hidden=pol_hidden)
 
             state = torch.load(self._last_ckpt_path, map_location="cpu")
             feature.load_state_dict(state["feature"])
             policy.load_state_dict(state["policy"])
 
-            def eval_episode():
+            def eval_episode(max_steps: int = 10000):
                 obs, _ = env.reset()
                 equity = [env.nav]
                 rewards, trades = [], []
                 h1 = h2 = None
                 done = False
                 steps = 0
-                while not done and steps < 10000:
+                while not done and steps < max_steps:
                     x = torch.tensor(obs, dtype=torch.float32).view(1, 1, -1)
                     z, h1 = feature(x, h1)
                     mu, std, v, h2 = policy(z, h2)
-                    a = torch.tanh(mu).detach().view(-1).numpy()
+                    a = torch.tanh(mu).detach().view(-1).numpy()  # greedy action
                     obs, r, done, _, info = env.step(a)
                     rewards.append(float(r))
                     equity.append(float(info["nav"]))
@@ -285,7 +320,6 @@ class Callbacks:
             eval_plot_path = os.path.join(self.run_dir, "eval_plot.png")
             try:
                 import matplotlib.pyplot as plt
-                import numpy as np
                 eq = np.array(metrics.equity_curve, dtype=float)
                 if len(eq) > 1:
                     plt.figure(figsize=(10, 5))
